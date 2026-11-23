@@ -241,6 +241,53 @@ impl App {
         });
         ui.add_space(2.0);
 
+        // ---- Favourite and note -----------------------------------------------------
+        let tcp = l.proto == Proto::Tcp;
+        let favourite = self.sh.settings.is_favourite(tcp, l.port);
+        if self.note_edit.0 != Some((tcp, l.port)) {
+            self.note_edit = (
+                Some((tcp, l.port)),
+                self.sh.settings.note(tcp, l.port).to_string(),
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let star = if favourite {
+                Icon::STAR_FILLED
+            } else {
+                Icon::STAR
+            };
+            if widgets::small_button(ui, star.glyph())
+                .on_hover_text(if favourite {
+                    "A favourite. Click to remove the star."
+                } else {
+                    "Mark this port as a favourite"
+                })
+                .clicked()
+            {
+                self.sh.settings.toggle_favourite(tcp, l.port);
+                self.sh.touch_settings();
+            }
+            let hint = format!("Your note for {} {}", l.proto.label(), l.port);
+            let width = (ui.available_width() - 24.0).max(120.0);
+            let edit = widgets::text_box(ui, &mut self.note_edit.1, width, &hint).on_hover_text(
+                "Kept for this port number. Shown in the table and found by the search.",
+            );
+            if edit.changed() {
+                if self.note_edit.1.chars().count() > crate::settings::NOTE_LIMIT {
+                    self.note_edit.1 = self
+                        .note_edit
+                        .1
+                        .chars()
+                        .take(crate::settings::NOTE_LIMIT)
+                        .collect();
+                }
+                self.sh.settings.set_note(tcp, l.port, &self.note_edit.1);
+                self.sh.touch_settings();
+            }
+        });
+        ui.add_space(2.0);
+
         // ---- Main actions -----------------------------------------------------------
         let blocked = end_blocked_reason(l.pid);
         ui.horizontal(|ui| {

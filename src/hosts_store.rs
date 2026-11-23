@@ -113,33 +113,47 @@ impl Backup {
     }
 }
 
+/// The largest hosts file SocketForge writes or imports. Block lists with a
+/// few hundred thousand names stay far below this.
+pub const MAX_HOSTS_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The backup files, newest first, without opening them.
+fn backup_files(paths: &HostsPaths) -> Vec<(PathBuf, std::fs::Metadata)> {
+    let mut out: Vec<(std::time::SystemTime, PathBuf, std::fs::Metadata)> =
+        std::fs::read_dir(&paths.backups)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                let name = path.file_name()?.to_string_lossy().to_lowercase();
+                if !(name.starts_with("hosts-") && name.ends_with(".bak")) {
+                    return None;
+                }
+                let meta = e.metadata().ok()?;
+                let precise = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                Some((precise, path, meta))
+            })
+            .collect();
+    // File times have sub-second precision, so backups made in the same second keep their order.
+    out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    out.into_iter().map(|(_, p, m)| (p, m)).collect()
+}
+
 /// Backups, newest first.
 pub fn list_backups(paths: &HostsPaths) -> Vec<Backup> {
-    let mut out: Vec<(std::time::SystemTime, Backup)> = std::fs::read_dir(&paths.backups)
+    backup_files(paths)
         .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let path = e.path();
-            let name = path.file_name()?.to_string_lossy().to_lowercase();
-            if !(name.starts_with("hosts-") && name.ends_with(".bak")) {
-                return None;
-            }
-            let meta = e.metadata().ok()?;
+        .filter_map(|(path, meta)| {
             let bytes = std::fs::read(&path).ok()?;
-            let precise = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-            let backup = Backup {
+            Some(Backup {
                 time: unix_mtime(&meta).unwrap_or(0),
                 size: meta.len(),
-                entries: HostsDoc::from_bytes(&bytes).entry_count(),
+                entries: crate::hosts::quick_entry_count(&bytes),
                 path,
-            };
-            Some((precise, backup))
+            })
         })
-        .collect();
-    // File times have sub-second precision, so backups made in the same second keep their order.
-    out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.path.cmp(&a.1.path)));
-    out.into_iter().map(|(_, b)| b).collect()
+        .collect()
 }
 
 /// Copies the current hosts file into the backup folder. Returns None when
@@ -150,8 +164,10 @@ pub fn backup_now(paths: &HostsPaths) -> Result<Option<PathBuf>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("Could not read the hosts file for the backup: {e}")),
     };
-    if let Some(newest) = list_backups(paths).first() {
-        if std::fs::read(&newest.path).ok().as_deref() == Some(&current[..]) {
+    if let Some((newest, meta)) = backup_files(paths).first() {
+        if meta.len() == current.len() as u64
+            && std::fs::read(newest).ok().as_deref() == Some(&current[..])
+        {
             return Ok(None);
         }
     }
@@ -170,10 +186,9 @@ pub fn backup_now(paths: &HostsPaths) -> Result<Option<PathBuf>, String> {
 
 /// Removes the oldest backups so that at most `keep` remain.
 pub fn prune_backups(paths: &HostsPaths, keep: usize) -> usize {
-    let all = list_backups(paths);
     let mut removed = 0;
-    for b in all.iter().skip(keep.max(1)) {
-        if std::fs::remove_file(&b.path).is_ok() {
+    for (path, _) in backup_files(paths).iter().skip(keep.max(1)) {
+        if std::fs::remove_file(path).is_ok() {
             removed += 1;
         }
     }
@@ -257,6 +272,18 @@ fn prepare(
     })
 }
 
+/// Says no before a backup is made or the administrator prompt appears.
+fn check_size(bytes: &[u8]) -> Result<(), SaveError> {
+    if bytes.len() as u64 > MAX_HOSTS_BYTES {
+        return Err(SaveError::Other(
+            "The hosts file would be larger than 32 MB. Windows becomes very slow with a file \
+             that size; remove some entries first."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Writes `bytes` over the file in place (keeping its permissions), with the
 /// read-only attribute lifted for the moment when asked.
 pub fn write_in_place(target: &Path, bytes: &[u8], clear_read_only: bool) -> std::io::Result<()> {
@@ -290,6 +317,7 @@ pub fn save(
     options: SaveOptions,
 ) -> Result<SaveOutcome, SaveError> {
     let bytes = doc.to_bytes();
+    check_size(&bytes)?;
     let outcome = prepare(paths, &bytes, loaded_bytes, options)?;
     if outcome.unchanged {
         return Ok(outcome);
@@ -318,8 +346,8 @@ pub fn apply_hosts(source: &Path, target: &Path, clear_read_only: bool) -> Resul
     }
     let bytes =
         std::fs::read(source).map_err(|e| format!("Could not read the new content: {e}"))?;
-    if bytes.len() > 16 * 1024 * 1024 {
-        return Err("Refusing to write: the new content is larger than 16 MB.".into());
+    if bytes.len() as u64 > MAX_HOSTS_BYTES {
+        return Err("Refusing to write: the new content is larger than 32 MB.".into());
     }
     write_in_place(target, &bytes, clear_read_only)
         .map_err(|e| format!("Could not write the hosts file: {e}"))
@@ -336,6 +364,7 @@ pub fn save_elevated(
     flush_dns_after: bool,
 ) -> Result<SaveOutcome, SaveError> {
     let bytes = doc.to_bytes();
+    check_size(&bytes)?;
     let outcome = prepare(paths, &bytes, loaded_bytes, options)?;
     if outcome.unchanged {
         return Ok(outcome);
@@ -414,7 +443,14 @@ fn run_elevated_and_wait(exe: &str, params: &str) -> Result<u32, String> {
         let mut code = 1u32;
         let ok = GetExitCodeProcess(info.hProcess, &mut code).is_ok();
         let _ = CloseHandle(info.hProcess);
-        if ok {
+        // 259 = still running: the helper did not finish within a minute.
+        if ok && code == 259 {
+            Err(
+                "The elevated save did not finish within a minute. Reload to see whether the \
+                 hosts file was written."
+                    .into(),
+            )
+        } else if ok {
             Ok(code)
         } else {
             Err("Could not read the result of the elevated save.".into())
@@ -454,6 +490,118 @@ pub fn flush_dns() -> Result<(), String> {
     } else {
         Err("Windows did not flush the DNS cache.".into())
     }
+}
+
+/// One name Windows currently remembers an answer for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DnsCacheEntry {
+    pub name: String,
+    /// The DNS record type number (1 = A, 28 = AAAA, ...).
+    pub record_type: u16,
+}
+
+/// The usual name of a DNS record type.
+pub fn record_type_label(t: u16) -> String {
+    match t {
+        1 => "A".into(),
+        2 => "NS".into(),
+        5 => "CNAME".into(),
+        6 => "SOA".into(),
+        12 => "PTR".into(),
+        15 => "MX".into(),
+        16 => "TXT".into(),
+        28 => "AAAA".into(),
+        33 => "SRV".into(),
+        64 => "SVCB".into(),
+        65 => "HTTPS".into(),
+        n => format!("Type {n}"),
+    }
+}
+
+/// What a record type means, for the tooltip.
+pub fn record_type_hint(t: u16) -> &'static str {
+    match t {
+        1 => "An IPv4 address for the name",
+        28 => "An IPv6 address for the name",
+        5 => "Another name this one stands for",
+        12 => "The name of an address (reverse lookup)",
+        33 => "Where a service of the domain runs",
+        65 | 64 => "How to connect to the site over HTTPS",
+        15 => "The mail server of the domain",
+        16 => "Free text published for the domain",
+        _ => "",
+    }
+}
+
+/// Sorts and removes repeats: by name without regard to case, then by type.
+pub fn tidy_dns_cache(mut entries: Vec<DnsCacheEntry>) -> Vec<DnsCacheEntry> {
+    entries.retain(|e| !e.name.trim().is_empty());
+    entries.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then(a.record_type.cmp(&b.record_type))
+    });
+    entries.dedup_by(|a, b| a.record_type == b.record_type && a.name.eq_ignore_ascii_case(&b.name));
+    entries
+}
+
+/// The names in the Windows DNS resolver cache (what `ipconfig /displaydns`
+/// lists). Reading it changes nothing and needs no administrator rights.
+pub fn dns_cache() -> Result<Vec<DnsCacheEntry>, String> {
+    #[repr(C)]
+    struct RawEntry {
+        next: *mut RawEntry,
+        name: *const u16,
+        record_type: u16,
+        data_length: u16,
+        flags: u32,
+    }
+    #[link(name = "dnsapi")]
+    extern "system" {
+        fn DnsGetCacheDataTable(first: *mut RawEntry) -> i32;
+        fn DnsFree(data: *const core::ffi::c_void, free_type: i32);
+    }
+    // Windows stores the head of the list in the `next` field of the entry handed in.
+    let mut head = RawEntry {
+        next: std::ptr::null_mut(),
+        name: std::ptr::null(),
+        record_type: 0,
+        data_length: 0,
+        flags: 0,
+    };
+    let mut out = Vec::new();
+    unsafe {
+        if DnsGetCacheDataTable(&mut head) == 0 {
+            return Err(
+                "Windows did not hand out the DNS cache. The DNS Client service may be \
+                 switched off."
+                    .into(),
+            );
+        }
+        let mut at = head.next;
+        // A bound, in case the list is ever damaged.
+        let mut left = 200_000;
+        while !at.is_null() && left > 0 {
+            left -= 1;
+            let entry = &*at;
+            let next = entry.next;
+            if !entry.name.is_null() {
+                let mut len = 0;
+                while len < 1024 && *entry.name.add(len) != 0 {
+                    len += 1;
+                }
+                out.push(DnsCacheEntry {
+                    name: String::from_utf16_lossy(std::slice::from_raw_parts(entry.name, len)),
+                    record_type: entry.record_type,
+                });
+                DnsFree(entry.name as *const core::ffi::c_void, 0);
+            }
+            DnsFree(at as *const core::ffi::c_void, 0);
+            at = next;
+        }
+    }
+    Ok(tidy_dns_cache(out))
 }
 
 /// Saved profiles; a missing or damaged file is an empty list.
@@ -642,6 +790,89 @@ mod tests {
             b"127.0.0.1 staged.test\r\n"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_content_is_refused_before_anything_is_touched() {
+        let (dir, paths) = sandbox("big");
+        std::fs::write(&paths.hosts, ORIGINAL).unwrap();
+        let mut doc = HostsDoc::from_bytes(ORIGINAL);
+        let filler = "x".repeat(1000);
+        let big: String = (0..33 * 1024)
+            .map(|i| format!("# {i} {filler}\r\n"))
+            .collect();
+        doc.set_text(&big);
+        let result = save(&paths, &doc, Some(ORIGINAL), SaveOptions::default());
+        assert!(matches!(result, Err(SaveError::Other(m)) if m.contains("32 MB")));
+        assert_eq!(std::fs::read(&paths.hosts).unwrap(), ORIGINAL);
+        assert!(
+            list_backups(&paths).is_empty(),
+            "no backup of a refused save"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn large_backups_are_listed_without_parsing_them() {
+        let (dir, paths) = sandbox("largebak");
+        let text: String = (0..30_000)
+            .map(|i| format!("0.0.0.0 ads{i}.example\r\n"))
+            .collect();
+        std::fs::write(&paths.hosts, &text).unwrap();
+        assert!(backup_now(&paths).unwrap().is_some());
+        assert!(backup_now(&paths).unwrap().is_none(), "same content");
+        let list = list_backups(&paths);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].entries, 30_000);
+        assert_eq!(list[0].size, text.len() as u64);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dns_cache_entries_are_tidied_and_labelled() {
+        let e = |name: &str, t: u16| DnsCacheEntry {
+            name: name.into(),
+            record_type: t,
+        };
+        let tidy = tidy_dns_cache(vec![
+            e("b.example", 28),
+            e("B.example", 1),
+            e("a.example", 1),
+            e("", 1),
+            e("A.EXAMPLE", 1),
+            e("b.example", 1),
+        ]);
+        let got: Vec<(String, u16)> = tidy
+            .iter()
+            .map(|e| (e.name.to_lowercase(), e.record_type))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("a.example".to_string(), 1),
+                ("b.example".to_string(), 1),
+                ("b.example".to_string(), 28)
+            ]
+        );
+        assert_eq!(record_type_label(1), "A");
+        assert_eq!(record_type_label(28), "AAAA");
+        assert_eq!(record_type_label(999), "Type 999");
+        assert!(!record_type_hint(1).is_empty());
+    }
+
+    #[test]
+    fn the_real_dns_cache_can_be_read() {
+        // Read-only. Only the shape is checked; no name is printed.
+        match dns_cache() {
+            Ok(entries) => {
+                assert!(entries.iter().all(|e| !e.name.is_empty()));
+                // Reading twice must work too (the first call frees what Windows allocated).
+                assert!(dns_cache().is_ok());
+            }
+            // With the DNS Client service switched off there is no cache:
+            // that is a message for the user, not a crash.
+            Err(e) => assert!(e.contains("DNS")),
+        }
     }
 
     #[test]

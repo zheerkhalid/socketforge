@@ -297,6 +297,9 @@ impl Icon {
     pub const TAG: Icon = Icon("\u{E8EC}");
     pub const SWITCH: Icon = Icon("\u{E8AB}");
     pub const TARGET: Icon = Icon("\u{E7B7}");
+    pub const STAR: Icon = Icon("\u{E734}");
+    pub const STAR_FILLED: Icon = Icon("\u{E735}");
+    pub const TOOLS: Icon = Icon("\u{E90F}");
 
     /// The glyph, or an empty string when the icon font is unavailable.
     pub fn glyph(self) -> &'static str {

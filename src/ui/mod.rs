@@ -10,6 +10,7 @@ mod rules_view;
 mod settings_view;
 mod shared;
 mod theme;
+mod tools_view;
 mod widgets;
 mod worker;
 

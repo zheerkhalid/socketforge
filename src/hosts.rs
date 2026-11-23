@@ -6,7 +6,7 @@
 //! toggling one entry changes one line.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,6 +150,126 @@ pub struct MergeReport {
     pub already_present: usize,
     /// Names that already point somewhere else: added switched off.
     pub conflicts: usize,
+}
+
+/// What adding a block list did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockReport {
+    /// Names added, each on its own line.
+    pub added: usize,
+    /// Names the file already sends nowhere.
+    pub already_blocked: usize,
+    /// Names the file maps to a real address: left as they are.
+    pub kept_yours: usize,
+}
+
+/// The names found in a block list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockList {
+    /// Lower case, each name once, in the order of the list.
+    pub names: Vec<String>,
+    /// Names that appeared more than once in the list.
+    pub repeats: usize,
+    /// Lines that are not a usable name (wildcards, rules with options, bad names).
+    pub skipped: usize,
+}
+
+/// Names that every hosts-style block list carries for the machine itself;
+/// they are not part of what the list blocks.
+const NEVER_BLOCK: [&str; 9] = [
+    "localhost",
+    "localhost.localdomain",
+    "local",
+    "broadcasthost",
+    "ip6-localhost",
+    "ip6-loopback",
+    "ip6-localnet",
+    "ip6-allnodes",
+    "ip6-allrouters",
+];
+
+/// Reads a block list in any of the common shapes: a hosts file
+/// (`0.0.0.0 ads.example`), one name per line, or filter rules of the form
+/// `||ads.example^`. Comments (`#`, `!`) and the machine's own names are ignored.
+pub fn parse_block_list(text: &str) -> BlockList {
+    let mut out = BlockList::default();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut take = |name: &str, out: &mut BlockList| {
+        let name = name.trim_end_matches('.').to_lowercase();
+        if NEVER_BLOCK.contains(&name.as_str()) || parse_ip(&name).is_some() {
+            return;
+        }
+        if !name.contains('.') || name_problem(&name).is_some() {
+            out.skipped += 1;
+        } else if seen.insert(name.clone()) {
+            out.names.push(name);
+        } else {
+            out.repeats += 1;
+        }
+    };
+    for line in text.lines() {
+        let line = line.trim_start_matches('\u{feff}').trim();
+        if line.is_empty() || line.starts_with('!') || line.starts_with('[') {
+            continue;
+        }
+        let body = line.split('#').next().unwrap_or("").trim();
+        if body.is_empty() {
+            continue;
+        }
+        if let Some(rule) = body.strip_prefix("||") {
+            match rule.strip_suffix('^') {
+                Some(name) => take(name, &mut out),
+                None => out.skipped += 1,
+            }
+            continue;
+        }
+        let mut tokens = body.split_whitespace();
+        let first = tokens.next().unwrap_or("");
+        if parse_ip(first).is_some() {
+            for name in tokens {
+                take(name, &mut out);
+            }
+        } else if tokens.next().is_none() {
+            take(first, &mut out);
+        } else {
+            out.skipped += 1;
+        }
+    }
+    out
+}
+
+/// True when the file looks like a block list: many entries, nearly all of
+/// them pointing nowhere (0.0.0.0 or this PC).
+pub fn looks_like_block_list(doc: &HostsDoc) -> bool {
+    let (mut total, mut sunk) = (0usize, 0usize);
+    for l in &doc.lines {
+        if let LineKind::Entry(e) = &l.kind {
+            if e.enabled {
+                total += 1;
+                sunk += parse_ip(&e.ip).is_some_and(|ip| ip.is_unspecified() || ip.is_loopback())
+                    as usize;
+            }
+        }
+    }
+    total >= 20 && sunk * 10 >= total * 9
+}
+
+/// Counts the entries in the bytes of a hosts file. Large files are scanned
+/// without building a document, which keeps a long list of backups quick.
+pub fn quick_entry_count(bytes: &[u8]) -> usize {
+    if bytes.len() < 256 * 1024 || bytes.starts_with(&[0xFF, 0xFE]) {
+        return HostsDoc::from_bytes(bytes).entry_count();
+    }
+    bytes
+        .split(|b| *b == b'\n')
+        .filter(|line| {
+            let text = String::from_utf8_lossy(line);
+            let t = text.trim();
+            let t = t.strip_prefix('#').unwrap_or(t);
+            let mut tokens = t.split('#').next().unwrap_or("").split_whitespace();
+            matches!((tokens.next(), tokens.next()), (Some(ip), Some(_)) if parse_ip(ip).is_some())
+        })
+        .count()
 }
 
 const PROFILE_BEGIN: &str = "# >>> SocketForge profile: ";
@@ -688,6 +808,7 @@ impl HostsDoc {
         for r in self.rows() {
             note(&r.entry, &mut have);
         }
+        let mut fresh_entries = Vec::new();
         for r in other.rows() {
             let Some(ip) = parse_ip(&r.entry.ip) else {
                 continue;
@@ -719,10 +840,120 @@ impl HostsDoc {
                     comment: r.entry.comment.clone(),
                 };
                 note(&e, &mut have);
-                self.add_entry(e, Some(group));
+                fresh_entries.push(e);
             }
         }
+        self.add_entries(fresh_entries, group);
         report
+    }
+
+    /// Adds many entries to one group in a single pass (adding them one by
+    /// one would walk the whole file each time). Returns how many were added.
+    pub fn add_entries(&mut self, entries: Vec<Entry>, group: &str) -> usize {
+        let total = entries.len();
+        let mut it = entries.into_iter();
+        let Some(first) = it.next() else {
+            return 0;
+        };
+        let at = self.add_entry(first, Some(group));
+        if total == 1 {
+            return 1;
+        }
+        let eol = self.dominant_eol();
+        let rest: Vec<Line> = it
+            .map(|e| {
+                let raw = e.format();
+                Line {
+                    kind: classify(&raw),
+                    raw,
+                    eol: Some(eol),
+                }
+            })
+            .collect();
+        // When the first entry ended the file, the last new line now does,
+        // and it ends the file the same way.
+        let was_last = at + 1 == self.lines.len();
+        let tail = self.lines[at].eol;
+        self.lines[at].eol = Some(tail.unwrap_or(eol));
+        self.lines.splice(at + 1..at + 1, rest);
+        if was_last {
+            if let Some(last) = self.lines.last_mut() {
+                last.eol = tail;
+            }
+        }
+        total
+    }
+
+    /// Adds the names of a block list, one per line, pointing at `sink`
+    /// (normally `0.0.0.0`). Names the file already maps are left alone.
+    pub fn add_block_list(&mut self, names: &[String], sink: &str, group: &str) -> BlockReport {
+        let mut report = BlockReport::default();
+        // name -> true when the enabled lines that list it all send it nowhere.
+        let mut have: HashMap<String, bool> = HashMap::new();
+        for l in &self.lines {
+            let LineKind::Entry(e) = &l.kind else {
+                continue;
+            };
+            if !e.enabled {
+                continue;
+            }
+            let blocked = parse_ip(&e.ip).is_some_and(|ip| ip.is_unspecified() || ip.is_loopback());
+            for h in &e.hosts {
+                let slot = have.entry(h.to_lowercase()).or_insert(blocked);
+                *slot = *slot && blocked;
+            }
+        }
+        let mut fresh = Vec::new();
+        for name in names {
+            let key = name.to_lowercase();
+            match have.get(&key) {
+                Some(true) => report.already_blocked += 1,
+                Some(false) => report.kept_yours += 1,
+                None => {
+                    have.insert(key.clone(), true);
+                    fresh.push(Entry {
+                        enabled: true,
+                        ip: sink.to_string(),
+                        hosts: vec![key],
+                        comment: String::new(),
+                    });
+                }
+            }
+        }
+        report.added = self.add_entries(fresh, group);
+        report
+    }
+
+    /// Removes names that repeat an earlier enabled line with the same
+    /// address (the lines the editor marks "Duplicate"). A line that only
+    /// held repeats is deleted. Returns the number of names removed.
+    pub fn remove_duplicates(&mut self) -> usize {
+        let mut seen: HashSet<(String, IpAddr)> = HashSet::new();
+        let mut removed = 0;
+        let mut drop_lines = Vec::new();
+        for (i, l) in self.lines.iter_mut().enumerate() {
+            let LineKind::Entry(e) = &mut l.kind else {
+                continue;
+            };
+            let (Some(ip), true) = (parse_ip(&e.ip), e.enabled) else {
+                continue;
+            };
+            let before = e.hosts.len();
+            e.hosts.retain(|h| seen.insert((h.to_lowercase(), ip)));
+            if e.hosts.len() == before {
+                continue;
+            }
+            removed += before - e.hosts.len();
+            if e.hosts.is_empty() {
+                drop_lines.push(i);
+            } else {
+                l.raw = e.format();
+            }
+        }
+        for i in drop_lines.into_iter().rev() {
+            self.delete_line(i);
+        }
+        removed
     }
 
     // ---- profiles -----------------------------------------------------------------
@@ -1203,6 +1434,154 @@ fe80::1%12 router.test\r\n\
         let again = doc.merge(&other, "Imported");
         assert_eq!(again.added, 0);
         assert!(doc.issues().is_empty());
+    }
+
+    #[test]
+    fn bulk_add_matches_adding_one_by_one() {
+        let make = |n: usize| -> Vec<Entry> {
+            (0..n)
+                .map(|i| Entry::new("0.0.0.0", &[&format!("ads{i}.example")]))
+                .collect()
+        };
+        for start in [
+            "127.0.0.1 a.test\r\n",
+            "127.0.0.1 a.test",
+            "",
+            "# Block\n0.0.0.0 x.example\n\n10.0.0.1 b.test\n",
+            "# Block\n0.0.0.0 x.example",
+            "127.0.0.1 a.test\r\n\r\n# >>> SocketForge profile: dev\r\n127.0.0.1\td.test\r\n\
+             # <<< SocketForge profile: dev\r\n",
+        ] {
+            for n in [0, 1, 2, 7] {
+                let mut slow = HostsDoc::parse(start);
+                for e in make(n) {
+                    slow.add_entry(e, Some("Block"));
+                }
+                let mut fast = HostsDoc::parse(start);
+                assert_eq!(fast.add_entries(make(n), "Block"), n);
+                assert_eq!(fast.to_text(), slow.to_text(), "{start:?} + {n}");
+                assert_eq!(HostsDoc::parse(&fast.to_text()), fast);
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_add_is_quick_for_a_large_list() {
+        let mut doc = HostsDoc::parse("127.0.0.1 a.test\r\n");
+        let names: Vec<String> = (0..60_000).map(|i| format!("ads{i}.example")).collect();
+        let started = std::time::Instant::now();
+        let report = doc.add_block_list(&names, "0.0.0.0", "Block list");
+        assert_eq!(report.added, 60_000);
+        assert_eq!(doc.entry_count(), 60_001);
+        // One by one this walked the whole file for every name.
+        assert!(started.elapsed().as_secs() < 20, "{:?}", started.elapsed());
+        let again = doc.add_block_list(&names, "0.0.0.0", "Block list");
+        assert_eq!((again.added, again.already_blocked), (0, 60_000));
+        assert!(looks_like_block_list(&doc));
+        assert_eq!(quick_entry_count(&doc.to_bytes()), 60_001);
+    }
+
+    #[test]
+    fn block_lists_in_every_common_shape() {
+        let list = parse_block_list(
+            "# Title: example list\n\
+             ! adblock comment\n\
+             [Adblock Plus 2.0]\n\
+             127.0.0.1 localhost\n\
+             ::1 ip6-localhost ip6-loopback\n\
+             0.0.0.0 0.0.0.0\n\
+             0.0.0.0 ads.example tracker.example # two on a line\n\
+             127.0.0.1\tADS.example\n\
+             plain.example\n\
+             trailing-dot.example.\n\
+             ||rule.example^\n\
+             ||with-options.example^$third-party\n\
+             ||*.wild.example^\n\
+             not a list line\n\
+             nodot\n\
+             bad/name.example\n",
+        );
+        assert_eq!(
+            list.names,
+            vec![
+                "ads.example",
+                "tracker.example",
+                "plain.example",
+                "trailing-dot.example",
+                "rule.example"
+            ]
+        );
+        assert_eq!(list.repeats, 1);
+        assert_eq!(list.skipped, 5);
+        assert!(parse_block_list("").names.is_empty());
+    }
+
+    #[test]
+    fn block_list_leaves_your_own_mappings_alone() {
+        let mut doc = HostsDoc::parse(
+            "10.0.0.5 intranet.example\r\n0.0.0.0 ads.example\r\n# 0.0.0.0 off.example\r\n",
+        );
+        let names: Vec<String> = [
+            "intranet.example",
+            "ads.example",
+            "off.example",
+            "new.example",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let report = doc.add_block_list(&names, "0.0.0.0", "Block list");
+        assert_eq!(
+            report,
+            BlockReport {
+                added: 2,
+                already_blocked: 1,
+                kept_yours: 1
+            }
+        );
+        assert!(doc
+            .to_text()
+            .ends_with("\r\n\r\n# Block list\r\n0.0.0.0\toff.example\r\n0.0.0.0\tnew.example\r\n"));
+        assert!(doc.issues().is_empty());
+        assert!(!looks_like_block_list(&doc));
+    }
+
+    #[test]
+    fn duplicates_can_be_removed() {
+        let mut doc = HostsDoc::parse(
+            "127.0.0.1 a.test b.test\n\
+             127.0.0.1 A.test\n\
+             127.0.0.1   b.test c.test # keep c\n\
+             ::1 a.test\n\
+             # 127.0.0.1 a.test\n\
+             10.0.0.1 a.test\n",
+        );
+        assert_eq!(doc.remove_duplicates(), 2);
+        assert_eq!(
+            doc.to_text(),
+            "127.0.0.1 a.test b.test\n127.0.0.1\tc.test # keep c\n::1 a.test\n\
+             # 127.0.0.1 a.test\n10.0.0.1 a.test\n"
+        );
+        // The conflict (another address) is not a duplicate and stays.
+        assert_eq!(doc.issues().len(), 1);
+        assert_eq!(doc.remove_duplicates(), 0);
+        assert_eq!(HostsDoc::parse(&doc.to_text()), doc);
+    }
+
+    #[test]
+    fn quick_count_agrees_with_the_parser() {
+        let mut text = String::from(SAMPLE);
+        for i in 0..20_000 {
+            text.push_str(&format!(
+                "0.0.0.0 ads{i}.example\r\n# 0.0.0.0 off{i}.example\r\n# note {i}\r\n"
+            ));
+        }
+        assert!(text.len() > 256 * 1024);
+        assert_eq!(
+            quick_entry_count(text.as_bytes()),
+            HostsDoc::parse(&text).entry_count()
+        );
+        assert_eq!(quick_entry_count(SAMPLE.as_bytes()), 7);
     }
 
     #[test]

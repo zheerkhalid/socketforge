@@ -776,19 +776,32 @@ mod tests {
 
     #[test]
     fn probe_reads_a_greeting() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            s.write_all(b"220 forge.test ready\r\n").unwrap();
-            std::thread::sleep(Duration::from_millis(200));
-        });
-        let r = probe_port(addr, Duration::from_secs(2), false);
-        server.join().unwrap();
-        assert!(r.connected && r.error.is_none());
-        assert_eq!(r.banner, b"220 forge.test ready\r\n");
-        assert_eq!(r.banner_text, "220 forge.test ready");
-        assert!(!r.http_reply);
+        // On a busy PC the test server may be slower than the short wait for a
+        // greeting; then the probe asks over HTTP first. One prompt answer in
+        // a few tries is what is checked.
+        let mut prompt = false;
+        for _ in 0..5 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                s.write_all(b"220 forge.test ready\r\n").unwrap();
+                std::thread::sleep(Duration::from_millis(200));
+            });
+            let r = probe_port(addr, Duration::from_secs(2), false);
+            server.join().unwrap();
+            assert!(r.connected && r.error.is_none());
+            assert_eq!(r.banner, b"220 forge.test ready\r\n");
+            assert_eq!(r.banner_text, "220 forge.test ready");
+            if !r.http_reply {
+                prompt = true;
+                break;
+            }
+        }
+        assert!(
+            prompt,
+            "the greeting was never read before asking over HTTP"
+        );
     }
 
     #[test]

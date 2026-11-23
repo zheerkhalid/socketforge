@@ -2,12 +2,17 @@
 //! backups and restore. Saving asks for elevation only when Windows refuses
 //! the write.
 
+use super::settings_view::thousands;
 use super::shared::Shared;
 use super::theme::{pal, regular, semibold, Icon, Palette};
 use super::widgets;
 use crate::export::{self, Format};
-use crate::hosts::{self, Entry, HostsDoc, Issue, Profile, ProfileEntry, Row};
-use crate::hosts_store::{self, Backup, HostsPaths, SaveError, SaveOptions, SaveOutcome};
+use crate::hosts::{
+    self, BlockList, Entry, HostsDoc, Issue, IssueKind, LineKind, Profile, ProfileEntry, Row,
+};
+use crate::hosts_store::{
+    self, Backup, DnsCacheEntry, HostsPaths, SaveError, SaveOptions, SaveOutcome,
+};
 use crate::model::now_unix;
 use crate::util::{fmt_age, fmt_time};
 use eframe::egui::{
@@ -19,6 +24,15 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 
 const ROW_H: f32 = 44.0;
+/// Height of a line in the fast raw view.
+const RAW_LINE_H: f32 = 20.0;
+/// Height of a row in the DNS cache list.
+const DNS_ROW_H: f32 = 38.0;
+/// Files with more lines open in the fast, read-only raw view: a text box
+/// lays out its whole content every frame, which is slow for long files.
+const LARGE_LINES: usize = 2000;
+/// Above this many names Windows itself gets slow with the hosts file.
+const MANY_NAMES: usize = 100_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Sub {
@@ -26,6 +40,7 @@ enum Sub {
     Raw,
     Profiles,
     Backups,
+    Dns,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,6 +73,101 @@ struct ImportDlg {
     file: String,
     doc: HostsDoc,
     group: String,
+    /// Entries in the file when it is read as a hosts file.
+    entries: usize,
+    /// Lines of it with problems.
+    problems: usize,
+    /// The names in the file when it is read as a block list.
+    block: BlockList,
+    /// Import as a block list (one line per name) instead of line by line.
+    as_block: bool,
+    /// Index into [`SINKS`].
+    sink: usize,
+}
+
+/// Where a blocked name is pointed. 0.0.0.0 fails at once; 127.0.0.1 makes
+/// programs try to connect to this PC first.
+const SINKS: [&str; 2] = ["0.0.0.0", "127.0.0.1"];
+
+impl ImportDlg {
+    fn new(file: &str, doc: HostsDoc) -> ImportDlg {
+        let block = hosts::parse_block_list(&doc.to_text());
+        let entries = doc.entry_count();
+        let as_block =
+            !block.names.is_empty() && (entries == 0 || hosts::looks_like_block_list(&doc));
+        ImportDlg {
+            group: ImportDlg::default_group(file, as_block),
+            file: file.to_string(),
+            entries,
+            problems: doc.issues().len(),
+            doc,
+            block,
+            as_block,
+            sink: 0,
+        }
+    }
+
+    fn default_group(file: &str, as_block: bool) -> String {
+        if as_block {
+            format!("Block list: {file}")
+        } else {
+            format!("Imported from {file}")
+        }
+    }
+
+    /// Switches between the two ways of importing; a group name that was not
+    /// edited follows the choice.
+    fn set_block(&mut self, as_block: bool) {
+        if self.group == ImportDlg::default_group(&self.file, self.as_block) {
+            self.group = ImportDlg::default_group(&self.file, as_block);
+        }
+        self.as_block = as_block;
+    }
+
+    /// What the dialog says about the file.
+    fn summary(&self) -> String {
+        if self.as_block {
+            let mut s = format!(
+                "{} has {} name{} to block",
+                self.file,
+                thousands(self.block.names.len()),
+                if self.block.names.len() == 1 { "" } else { "s" }
+            );
+            if self.block.repeats > 0 {
+                s.push_str(&format!(
+                    " ({} listed more than once)",
+                    thousands(self.block.repeats)
+                ));
+            }
+            s.push_str(
+                ". Each one gets its own line pointing at the address below, so the name \
+                 stops resolving on this PC. Names your hosts file already lists are left as \
+                 they are.",
+            );
+            if self.block.skipped > 0 {
+                s.push_str(&format!(
+                    " {} line{} that cannot go into a hosts file (wildcards, rules with \
+                     options) are skipped.",
+                    thousands(self.block.skipped),
+                    if self.block.skipped == 1 { "" } else { "s" }
+                ));
+            }
+            s
+        } else {
+            format!(
+                "{} has {} entries{}. Entries that are already in your hosts file are \
+                 skipped. A name that already points to a different address is added \
+                 switched off, so nothing that works now changes.",
+                self.file,
+                thousands(self.entries),
+                if self.problems > 0 {
+                    format!(" ({} with problems)", thousands(self.problems))
+                } else {
+                    String::new()
+                }
+            )
+        }
+    }
 }
 
 enum Dialog {
@@ -82,6 +192,8 @@ enum Act {
     Delete(usize),
     GroupToggle(String, bool),
     Collapse(String),
+    /// Text for the clipboard, and what to call it in the toast.
+    Copy(String, &'static str),
 }
 
 enum Item {
@@ -130,13 +242,31 @@ pub struct HostsView {
     raw_version: u64,
     visible: Vec<Item>,
     visible_key: (u64, String, Show, usize),
+    enabled_count: usize,
+    /// Group names without the profile blocks, in file order.
+    plain_groups: Vec<String>,
+    /// Names of the profile blocks in the file.
+    active_profiles: Vec<String>,
+    /// Names (lower case) that a switched-on entry maps.
+    names_on: HashSet<String>,
+    has_duplicates: bool,
+
+    /// A long file is being edited as text although that is slow.
+    raw_edit_large: bool,
+    /// Lines of the fast raw view that match the search.
+    raw_lines: Vec<usize>,
+    raw_lines_key: (u64, String),
+
+    /// The DNS cache as last read; None = not read yet.
+    dns: Option<Vec<DnsCacheEntry>>,
+    dns_error: Option<String>,
 }
 
 fn mono(size: f32) -> FontId {
     FontId::new(size, FontFamily::Monospace)
 }
 
-fn fmt_bytes(n: u64) -> String {
+pub(super) fn fmt_bytes(n: u64) -> String {
     if n < 1024 {
         format!("{n} bytes")
     } else if n < 1024 * 1024 {
@@ -226,6 +356,16 @@ impl HostsView {
             raw_version: u64::MAX,
             visible: Vec::new(),
             visible_key: (u64::MAX, String::new(), Show::All, 0),
+            enabled_count: 0,
+            plain_groups: Vec::new(),
+            active_profiles: Vec::new(),
+            names_on: HashSet::new(),
+            has_duplicates: false,
+            raw_edit_large: false,
+            raw_lines: Vec::new(),
+            raw_lines_key: (u64::MAX, String::new()),
+            dns: None,
+            dns_error: None,
         };
         if demo {
             // Invented content; the real hosts file is not even opened.
@@ -265,9 +405,31 @@ impl HostsView {
     }
 
     /// True while there are edits that have not been saved.
-    #[allow(dead_code)]
     pub fn has_unsaved(&self) -> bool {
         self.dirty
+    }
+
+    /// True while a save is under way (the administrator prompt may be open).
+    pub fn is_saving(&self) -> bool {
+        self.saving.is_some()
+    }
+
+    /// True while one of the editor's dialogs is open.
+    pub fn has_dialog(&self) -> bool {
+        self.dialog.is_some()
+    }
+
+    /// Saves the edits, as the Save button does.
+    pub fn save_now(&mut self, ctx: &egui::Context, sh: &mut Shared) {
+        if self.dirty && self.saving.is_none() {
+            let doc = self.doc.clone();
+            self.start_save(ctx, sh, doc, SaveOptions::default(), "Saved");
+        }
+    }
+
+    /// Opens the entries table (where the unsaved changes can be seen).
+    pub fn show_entries(&mut self) {
+        self.sub = Sub::Entries;
     }
 
     /// Opens a sub-view by its `--view` name.
@@ -276,6 +438,29 @@ impl HostsView {
             "hosts-raw" => self.sub = Sub::Raw,
             "hosts-profiles" => self.sub = Sub::Profiles,
             "hosts-backups" => self.sub = Sub::Backups,
+            "hosts-dns" => self.sub = Sub::Dns,
+            "hosts-raw-large" | "hosts-import" => {
+                if self.demo {
+                    // An invented block list, long enough for the fast raw view.
+                    let names: Vec<String> = (1..=4200)
+                        .map(|i| format!("ads-{i:04}.tracker.example.test"))
+                        .collect();
+                    if view == "hosts-import" {
+                        let text: String =
+                            names.iter().map(|n| format!("0.0.0.0 {n}\r\n")).collect();
+                        self.dialog = Some(Dialog::Import(ImportDlg::new(
+                            "blocklist.txt",
+                            HostsDoc::parse(&text),
+                        )));
+                    } else {
+                        self.doc
+                            .add_block_list(&names, SINKS[0], "Block list: blocklist.txt");
+                        self.loaded_bytes = self.doc.to_bytes();
+                        self.changed();
+                        self.sub = Sub::Raw;
+                    }
+                }
+            }
             "hosts-restore" => {
                 self.sub = Sub::Backups;
                 if !self.backups.is_empty() {
@@ -328,6 +513,71 @@ impl HostsView {
             self.issues_by_line.entry(issue.line).or_default().push(i);
         }
         self.dirty = self.doc.to_bytes() != self.loaded_bytes;
+        // Everything the page asks for every frame is worked out once here;
+        // with a long block list in the file that is the difference between
+        // a smooth window and a sluggish one.
+        self.enabled_count = self.rows.iter().filter(|r| r.entry.enabled).count();
+        self.has_duplicates = self.issues.iter().any(|i| i.kind == IssueKind::Duplicate);
+        self.active_profiles = self.doc.active_profiles();
+        self.plain_groups.clear();
+        self.names_on.clear();
+        let mut last_group = "";
+        for r in &self.rows {
+            if r.group != last_group {
+                last_group = r.group.as_str();
+                if !r.group.is_empty()
+                    && !r.group.starts_with("Profile: ")
+                    && !self.plain_groups.contains(&r.group)
+                {
+                    self.plain_groups.push(r.group.clone());
+                }
+            }
+            if r.entry.enabled {
+                for h in &r.entry.hosts {
+                    self.names_on.insert(h.to_lowercase());
+                }
+            }
+        }
+        if self.doc.lines.len() <= LARGE_LINES {
+            self.raw_edit_large = false;
+        }
+    }
+
+    fn profile_active(&self, name: &str) -> bool {
+        self.active_profiles.iter().any(|n| n == name)
+    }
+
+    fn flush_dns(&mut self, sh: &mut Shared) {
+        if self.demo {
+            sh.toast("Not available in the demo.", false);
+            return;
+        }
+        match hosts_store::flush_dns() {
+            Ok(()) => {
+                sh.toast("DNS cache flushed.", false);
+                if self.dns.is_some() {
+                    self.load_dns();
+                }
+            }
+            Err(e) => sh.toast(e, true),
+        }
+    }
+
+    fn load_dns(&mut self) {
+        if self.demo {
+            self.dns = Some(demo_dns_cache());
+            return;
+        }
+        match hosts_store::dns_cache() {
+            Ok(list) => {
+                self.dns = Some(list);
+                self.dns_error = None;
+            }
+            Err(e) => {
+                self.dns = Some(Vec::new());
+                self.dns_error = Some(e);
+            }
+        }
     }
 
     fn open_edit(&mut self, line: Option<usize>) {
@@ -530,16 +780,18 @@ impl HostsView {
         let save_key = ctx.input(|i| i.modifiers.command && i.key_pressed(Key::S));
         let busy = self.saving.is_some();
 
-        let enabled = self.rows.iter().filter(|r| r.entry.enabled).count();
+        let enabled = self.enabled_count;
         let subtitle = format!(
             "{} entries, {} switched on. Names listed here win over DNS on this PC.",
-            self.rows.len(),
-            enabled
+            thousands(self.rows.len()),
+            thousands(enabled)
         );
         let (mut do_save, mut do_revert, mut do_reload, mut do_import) =
             (save_key && self.dirty, false, false, false);
         let mut do_export: Option<Format> = None;
         let mut do_flush = false;
+        let mut do_dedupe = false;
+        let has_duplicates = self.has_duplicates;
         widgets::page_header(ui, "Hosts file", &subtitle, |ui| {
             let label = if busy {
                 "Saving…".to_string()
@@ -565,8 +817,25 @@ impl HostsView {
             }
             ui.menu_button(RichText::new(Icon::MORE.with("More")), |ui| {
                 ui.set_min_width(230.0);
-                if ui.button(Icon::IMPORT.with("Import and merge…")).clicked() {
+                if ui
+                    .button(Icon::IMPORT.with("Import a hosts file or block list…"))
+                    .clicked()
+                {
                     do_import = true;
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(
+                        has_duplicates,
+                        egui::Button::new(Icon::BROOM.with("Remove duplicates")),
+                    )
+                    .on_hover_text(
+                        "Removes names that repeat an earlier line with the same address",
+                    )
+                    .on_disabled_hover_text("No name is listed twice with the same address.")
+                    .clicked()
+                {
+                    do_dedupe = true;
                     ui.close_menu();
                 }
                 ui.separator();
@@ -603,10 +872,11 @@ impl HostsView {
             Layout::left_to_right(Align::Center),
             |ui| {
                 let tabs = [
-                    format!("Entries  {}", self.rows.len()),
+                    format!("Entries  {}", thousands(self.rows.len())),
                     "Raw text".to_string(),
                     format!("Profiles  {}", self.profiles.len()),
                     format!("Backups  {}", self.backups.len()),
+                    "DNS cache".to_string(),
                 ];
                 let labels: Vec<&str> = tabs.iter().map(String::as_str).collect();
                 let current = match self.sub {
@@ -614,9 +884,16 @@ impl HostsView {
                     Sub::Raw => 1,
                     Sub::Profiles => 2,
                     Sub::Backups => 3,
+                    Sub::Dns => 4,
                 };
                 if let Some(i) = widgets::segmented(ui, &labels, current) {
-                    self.sub = [Sub::Entries, Sub::Raw, Sub::Profiles, Sub::Backups][i];
+                    self.sub = [
+                        Sub::Entries,
+                        Sub::Raw,
+                        Sub::Profiles,
+                        Sub::Backups,
+                        Sub::Dns,
+                    ][i];
                 }
                 if self.sub == Sub::Entries {
                     ui.add_space(8.0);
@@ -644,9 +921,10 @@ impl HostsView {
 
         match self.sub {
             Sub::Entries => self.entries_ui(ui, sh, &p),
-            Sub::Raw => self.raw_ui(ui, &p),
+            Sub::Raw => self.raw_ui(ui, sh, &p),
             Sub::Profiles => self.profiles_ui(ui, sh, &p),
             Sub::Backups => self.backups_ui(ui, sh, &p),
+            Sub::Dns => self.dns_ui(ui, sh, &p),
         }
 
         // ---- Deferred actions -------------------------------------------------------
@@ -673,14 +951,19 @@ impl HostsView {
             }
         }
         if do_flush {
-            if self.demo {
-                sh.toast("Not available in the demo.", false);
-            } else {
-                match hosts_store::flush_dns() {
-                    Ok(()) => sh.toast("DNS cache flushed.", false),
-                    Err(e) => sh.toast(e, true),
-                }
-            }
+            self.flush_dns(sh);
+        }
+        if do_dedupe {
+            let removed = self.doc.remove_duplicates();
+            self.changed();
+            sh.toast(
+                format!(
+                    "Removed {} repeated name{}. Save to apply.",
+                    thousands(removed),
+                    if removed == 1 { "" } else { "s" }
+                ),
+                false,
+            );
         }
         if do_import {
             self.import(sh);
@@ -859,6 +1142,10 @@ impl HostsView {
                 }
                 Act::Edit(line) => self.open_edit(Some(line)),
                 Act::Delete(line) => self.dialog = Some(Dialog::Delete(line)),
+                Act::Copy(text, what) => {
+                    ui.ctx().copy_text(text);
+                    sh.toast(format!("Copied {what}."), false);
+                }
             }
         }
     }
@@ -1031,7 +1318,6 @@ impl HostsView {
         // Status badge
         let badge_rect = Rect::from_min_size(pos2(x, rect.top()), vec2(cols.status, ROW_H));
         if let Some(ids) = issue_ids {
-            use crate::hosts::IssueKind;
             let first = &self.issues[ids[0]];
             let (label, color) = match first.kind {
                 IssueKind::BadAddress => ("Bad address", p.danger),
@@ -1077,13 +1363,71 @@ impl HostsView {
         if resp.double_clicked() {
             acts.push(Act::Edit(row.line));
         }
+        resp.context_menu(|ui| {
+            ui.set_min_width(190.0);
+            let names = if e.hosts.len() == 1 {
+                "Copy the name"
+            } else {
+                "Copy the names"
+            };
+            if ui.button(Icon::COPY.with(names)).clicked() {
+                acts.push(Act::Copy(e.hosts.join(" "), "the names"));
+                ui.close_menu();
+            }
+            if ui.button("Copy the address").clicked() {
+                acts.push(Act::Copy(e.ip.clone(), "the address"));
+                ui.close_menu();
+            }
+            if ui.button("Copy the line").clicked() {
+                acts.push(Act::Copy(e.format(), "the line"));
+                ui.close_menu();
+            }
+            ui.separator();
+            let switch = if e.enabled { "Switch off" } else { "Switch on" };
+            if ui.button(switch).clicked() {
+                acts.push(Act::Toggle(row.line, !e.enabled));
+                ui.close_menu();
+            }
+            if ui.button(Icon::EDIT.with("Edit…")).clicked() {
+                acts.push(Act::Edit(row.line));
+                ui.close_menu();
+            }
+            if ui.button(Icon::DELETE.with("Delete…")).clicked() {
+                acts.push(Act::Delete(row.line));
+                ui.close_menu();
+            }
+        });
     }
 
     // ----------------------------------------------------------------------------------
     // Raw text
     // ----------------------------------------------------------------------------------
 
-    fn raw_ui(&mut self, ui: &mut Ui, p: &Palette) {
+    fn raw_ui(&mut self, ui: &mut Ui, sh: &Shared, p: &Palette) {
+        let large = self.doc.lines.len() > LARGE_LINES;
+        if large && !self.raw_edit_large {
+            self.raw_fast_ui(ui, sh, p);
+            return;
+        }
+        if large {
+            ui.allocate_ui_with_layout(
+                vec2(ui.available_width(), 30.0),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    ui.label(
+                        RichText::new(format!(
+                            "Editing {} lines as text. Typing is slow with a file this long.",
+                            thousands(self.doc.lines.len())
+                        ))
+                        .color(p.warn),
+                    );
+                    if widgets::small_button(ui, "Back to the fast view").clicked() {
+                        self.raw_edit_large = false;
+                    }
+                },
+            );
+        }
         if self.raw_version != self.version {
             self.raw = self.doc.to_text();
             self.raw_version = self.version;
@@ -1113,6 +1457,293 @@ impl HostsView {
             self.doc.set_text(&self.raw);
             self.changed();
             self.raw_version = self.version;
+        }
+    }
+
+    /// The raw text of a long file: only the lines on screen are drawn, with
+    /// line numbers, and the search box filters them. Read-only.
+    fn raw_fast_ui(&mut self, ui: &mut Ui, sh: &Shared, p: &Palette) {
+        let needle = sh.search.trim().to_lowercase();
+        if self.raw_lines_key.0 != self.version || self.raw_lines_key.1 != needle {
+            self.raw_lines = if needle.is_empty() {
+                Vec::new()
+            } else {
+                (0..self.doc.lines.len())
+                    .filter(|&i| self.doc.lines[i].raw.to_lowercase().contains(&needle))
+                    .collect()
+            };
+            self.raw_lines_key = (self.version, needle.clone());
+        }
+        let filtered = !needle.is_empty();
+        let count = if filtered {
+            self.raw_lines.len()
+        } else {
+            self.doc.lines.len()
+        };
+        ui.allocate_ui_with_layout(
+            vec2(ui.available_width(), 30.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let text = if filtered {
+                    format!(
+                        "{} of {} lines match the search.",
+                        thousands(count),
+                        thousands(self.doc.lines.len())
+                    )
+                } else {
+                    format!(
+                        "{} lines, shown read-only so that scrolling stays quick. Edit \
+                         entries in the table.",
+                        thousands(count)
+                    )
+                };
+                ui.label(RichText::new(text).color(p.muted));
+                if widgets::small_button(ui, &Icon::EDIT.with("Edit as text anyway"))
+                    .on_hover_text("Opens the whole file in a text box. Slow with a long file.")
+                    .clicked()
+                {
+                    self.raw_edit_large = true;
+                }
+            },
+        );
+        Frame::new()
+            .fill(p.card)
+            .stroke(Stroke::new(1.0_f32, p.border))
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(Margin::symmetric(6, 8))
+            .show(ui, |ui| {
+                ui.set_height(ui.available_height());
+                ui.set_width(ui.available_width());
+                if count == 0 {
+                    widgets::empty_state(
+                        ui,
+                        Icon::SEARCH,
+                        p.muted,
+                        "No matches",
+                        "No line of the file contains the search text.",
+                    );
+                    return;
+                }
+                let width = ui.available_width();
+                let digits = self.doc.lines.len().to_string().len() as f32;
+                let gutter = 22.0 + digits * 8.0;
+                ui.spacing_mut().item_spacing.y = 0.0;
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show_rows(ui, RAW_LINE_H, count, |ui, range| {
+                        for idx in range {
+                            let li = if filtered { self.raw_lines[idx] } else { idx };
+                            let line = &self.doc.lines[li];
+                            let (rect, _) =
+                                ui.allocate_exact_size(vec2(width, RAW_LINE_H), Sense::hover());
+                            ui.painter().text(
+                                pos2(rect.left() + gutter - 12.0, rect.center().y),
+                                Align2::RIGHT_CENTER,
+                                (li + 1).to_string(),
+                                mono(12.0),
+                                p.faint,
+                            );
+                            let color = if self.issues_by_line.contains_key(&li) {
+                                p.warn
+                            } else {
+                                match &line.kind {
+                                    LineKind::Entry(e) if e.enabled => p.text,
+                                    LineKind::Entry(_) => p.muted,
+                                    LineKind::Invalid => p.danger,
+                                    LineKind::Comment | LineKind::Blank => p.faint,
+                                }
+                            };
+                            let cell = Rect::from_min_max(
+                                pos2(rect.left() + gutter, rect.top()),
+                                pos2(rect.right() - 16.0, rect.bottom()),
+                            );
+                            widgets::text_in(ui, cell, &line.raw, mono(13.0), color);
+                        }
+                    });
+            });
+    }
+
+    // ----------------------------------------------------------------------------------
+    // DNS cache
+    // ----------------------------------------------------------------------------------
+
+    fn dns_ui(&mut self, ui: &mut Ui, sh: &mut Shared, p: &Palette) {
+        if self.dns.is_none() {
+            self.load_dns();
+        }
+        let (mut refresh, mut flush) = (false, false);
+        ui.allocate_ui_with_layout(
+            vec2(ui.available_width(), 40.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.label(
+                    RichText::new(
+                        "Names Windows looked up lately and still remembers. Flush the cache \
+                         to make it ask again.",
+                    )
+                    .color(p.muted),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if widgets::ghost_button(ui, &Icon::BROOM.with("Flush the cache"))
+                        .on_hover_text(
+                            "Forgets every remembered answer. Needs no administrator rights.",
+                        )
+                        .clicked()
+                    {
+                        flush = true;
+                    }
+                    if widgets::ghost_button(ui, &Icon::REFRESH.with("Read again")).clicked() {
+                        refresh = true;
+                    }
+                });
+            },
+        );
+        let needle = sh.search.trim().to_lowercase();
+        let list = self.dns.as_deref().unwrap_or(&[]);
+        let shown: Vec<&DnsCacheEntry> = list
+            .iter()
+            .filter(|e| needle.is_empty() || e.name.to_lowercase().contains(&needle))
+            .collect();
+        let mut copy: Option<String> = None;
+        let mut add: Option<String> = None;
+        if let Some(e) = &self.dns_error {
+            widgets::empty_state(
+                ui,
+                Icon::ERROR,
+                p.danger,
+                "The DNS cache could not be read",
+                e,
+            );
+        } else if list.is_empty() {
+            widgets::empty_state(
+                ui,
+                Icon::GLOBE,
+                p.accent,
+                "The DNS cache is empty",
+                "Windows has not looked up any name since the cache was last flushed.",
+            );
+        } else if shown.is_empty() {
+            let text = format!("No remembered name contains \"{}\".", sh.search.trim());
+            widgets::empty_state(ui, Icon::SEARCH, p.muted, "No matches", &text);
+        } else {
+            Frame::new()
+                .fill(p.card)
+                .stroke(Stroke::new(1.0_f32, p.border))
+                .corner_radius(CornerRadius::same(12))
+                .inner_margin(Margin::symmetric(6, 6))
+                .show(ui, |ui| {
+                    ui.set_height(ui.available_height());
+                    ui.set_width(ui.available_width());
+                    let width = ui.available_width();
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show_rows(ui, DNS_ROW_H, shown.len(), |ui, range| {
+                            for i in range {
+                                let e = shown[i];
+                                let (rect, resp) =
+                                    ui.allocate_exact_size(vec2(width, DNS_ROW_H), Sense::hover());
+                                if resp.hovered() {
+                                    ui.painter().rect_filled(
+                                        rect.shrink2(vec2(0.0, 1.0)),
+                                        CornerRadius::same(8),
+                                        p.hover,
+                                    );
+                                }
+                                let badge = Rect::from_min_size(
+                                    pos2(rect.left() + 12.0, rect.top()),
+                                    vec2(70.0, DNS_ROW_H),
+                                );
+                                let label = hosts_store::record_type_label(e.record_type);
+                                let color = match e.record_type {
+                                    1 => p.info,
+                                    28 => p.udp,
+                                    _ => p.muted,
+                                };
+                                let used = widgets::paint_badge(ui, badge, &label, color);
+                                let hint = hosts_store::record_type_hint(e.record_type);
+                                if !hint.is_empty() {
+                                    let hit = Rect::from_min_size(
+                                        pos2(badge.left(), rect.center().y - 11.0),
+                                        vec2(used, 22.0),
+                                    );
+                                    ui.interact(hit, ui.id().with(("dns-type", i)), Sense::hover())
+                                        .on_hover_text(hint);
+                                }
+                                let in_hosts = self.names_on.contains(&e.name.to_lowercase());
+                                let name = Rect::from_min_max(
+                                    pos2(rect.left() + 92.0, rect.top()),
+                                    pos2(rect.right() - 250.0, rect.bottom()),
+                                );
+                                widgets::text_in(ui, name, &e.name, semibold(14.0), p.text);
+                                if in_hosts {
+                                    let r = Rect::from_min_size(
+                                        pos2(rect.right() - 240.0, rect.top()),
+                                        vec2(150.0, DNS_ROW_H),
+                                    );
+                                    widgets::paint_badge(ui, r, "IN YOUR HOSTS FILE", p.accent);
+                                }
+                                let actions = Rect::from_min_max(
+                                    pos2(rect.right() - 80.0, rect.top()),
+                                    pos2(rect.right() - 4.0, rect.bottom()),
+                                );
+                                let mut child = ui.new_child(
+                                    UiBuilder::new()
+                                        .max_rect(actions)
+                                        .id_salt(("dns-act", i))
+                                        .layout(Layout::right_to_left(Align::Center)),
+                                );
+                                child.spacing_mut().item_spacing.x = 0.0;
+                                if widgets::icon_button(
+                                    &mut child,
+                                    Icon::ADD,
+                                    "Add this name to the hosts file…",
+                                )
+                                .clicked()
+                                {
+                                    add = Some(e.name.clone());
+                                }
+                                if widgets::icon_button(&mut child, Icon::COPY, "Copy the name")
+                                    .clicked()
+                                {
+                                    copy = Some(e.name.clone());
+                                }
+                            }
+                        });
+                });
+        }
+        if let Some(name) = copy {
+            ui.ctx().copy_text(name);
+            sh.toast("Copied the name.", false);
+        }
+        if let Some(name) = add {
+            self.dialog = Some(Dialog::Edit(EditDlg {
+                line: None,
+                ip: "127.0.0.1".into(),
+                names: name,
+                comment: String::new(),
+                group: String::new(),
+                enabled: true,
+                focus: true,
+            }));
+        }
+        if refresh {
+            self.load_dns();
+            if self.dns_error.is_none() {
+                let n = self.dns.as_ref().map(Vec::len).unwrap_or(0);
+                sh.toast(
+                    format!(
+                        "{} remembered name{}.",
+                        thousands(n),
+                        if n == 1 { "" } else { "s" }
+                    ),
+                    false,
+                );
+            }
+        }
+        if flush {
+            self.flush_dns(sh);
         }
     }
 
@@ -1153,23 +1784,22 @@ impl HostsView {
             if widgets::ghost_button(ui, &Icon::ADD.with("New profile")).clicked() {
                 new_profile = true;
             }
-            let groups: Vec<String> = self
-                .doc
-                .groups()
-                .into_iter()
-                .filter(|g| !g.starts_with("Profile: "))
-                .collect();
+            let groups: &[String] = &self.plain_groups;
             if !groups.is_empty() {
                 ui.menu_button(
                     RichText::new(Icon::TAG.with("Make a profile from a group")),
                     |ui| {
                         ui.set_min_width(240.0);
-                        for g in groups {
-                            if ui.button(&g).clicked() {
-                                from_group = Some(g);
-                                ui.close_menu();
-                            }
-                        }
+                        egui::ScrollArea::vertical()
+                            .max_height(320.0)
+                            .show(ui, |ui| {
+                                for g in groups {
+                                    if ui.button(g).clicked() {
+                                        from_group = Some(g.clone());
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
                     },
                 );
             }
@@ -1178,10 +1808,10 @@ impl HostsView {
 
         // Blocks that are in the file but not saved as a profile on this PC.
         let unsaved_blocks: Vec<String> = self
-            .doc
-            .active_profiles()
-            .into_iter()
-            .filter(|n| !self.profiles.iter().any(|p| &p.name == n))
+            .active_profiles
+            .iter()
+            .filter(|n| !self.profiles.iter().any(|p| &p.name == *n))
+            .cloned()
             .collect();
 
         if self.profiles.is_empty() && unsaved_blocks.is_empty() {
@@ -1202,7 +1832,7 @@ impl HostsView {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for (i, profile) in self.profiles.iter().enumerate() {
-                    let active = self.doc.is_profile_active(&profile.name);
+                    let active = self.profile_active(&profile.name);
                     widgets::card(ui, |ui| {
                         ui.allocate_ui_with_layout(
                             vec2(ui.available_width(), 30.0),
@@ -1516,14 +2146,17 @@ impl HostsView {
             return;
         }
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Choose a hosts file to merge in")
-            .add_filter("Hosts files and text", &["txt", "hosts", "bak", "*"])
+            .set_title("Choose a hosts file or a block list")
+            .add_filter(
+                "Hosts files, lists and text",
+                &["txt", "hosts", "bak", "list", "*"],
+            )
             .pick_file()
         else {
             return;
         };
         match std::fs::metadata(&path) {
-            Ok(m) if m.len() > 32 * 1024 * 1024 => {
+            Ok(m) if m.len() > hosts_store::MAX_HOSTS_BYTES => {
                 sh.toast("That file is larger than 32 MB.", true);
                 return;
             }
@@ -1531,20 +2164,16 @@ impl HostsView {
         }
         match std::fs::read(&path) {
             Ok(bytes) => {
-                let doc = HostsDoc::from_bytes(&bytes);
-                if doc.entry_count() == 0 {
-                    sh.toast("That file has no host entries.", true);
-                    return;
-                }
                 let file = path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.dialog = Some(Dialog::Import(ImportDlg {
-                    group: format!("Imported from {file}"),
-                    file,
-                    doc,
-                }));
+                let dlg = ImportDlg::new(&file, HostsDoc::from_bytes(&bytes));
+                if dlg.entries == 0 && dlg.block.names.is_empty() {
+                    sh.toast("That file has no host entries and no names to block.", true);
+                    return;
+                }
+                self.dialog = Some(Dialog::Import(dlg));
             }
             Err(e) => sh.toast(format!("Could not read the file: {e}"), true),
         }
@@ -1563,7 +2192,10 @@ impl HostsView {
             return;
         };
         match export::write(&path, &export::hosts(&self.rows, format), format) {
-            Ok(()) => sh.toast(format!("Exported {} entries.", self.rows.len()), false),
+            Ok(()) => sh.toast(
+                format!("Exported {} entries.", thousands(self.rows.len())),
+                false,
+            ),
             Err(e) => sh.toast(e, true),
         }
     }
@@ -1603,12 +2235,7 @@ impl HostsView {
         let mut keep = true;
         let mut apply = false;
         let problems = edit_problems(&d.ip, &d.names);
-        let groups: Vec<String> = self
-            .doc
-            .groups()
-            .into_iter()
-            .filter(|g| !g.starts_with("Profile: "))
-            .collect();
+        let groups: Vec<String> = self.plain_groups.clone();
         let in_profile = d.group.starts_with("Profile: ");
         let dismissed = widgets::modal(ctx, "hosts-edit", 480.0, |ui| {
             let p = pal(ui);
@@ -2054,7 +2681,7 @@ impl HostsView {
         let Some(profile) = self.profiles.get(index).cloned() else {
             return false;
         };
-        let active = self.doc.is_profile_active(&profile.name);
+        let active = self.profile_active(&profile.name);
         let (mut keep, mut delete) = (true, false);
         let dismissed = widgets::modal(ctx, "hosts-profile-delete", 430.0, |ui| {
             widgets::modal_title(ui, &format!("Delete the profile \"{}\"?", profile.name));
@@ -2091,25 +2718,57 @@ impl HostsView {
 
     fn import_dialog(&mut self, ctx: &egui::Context, sh: &mut Shared, d: &mut ImportDlg) -> bool {
         let (mut keep, mut merge) = (true, false);
-        let count = d.doc.entry_count();
-        let problems = d.doc.issues().len();
-        let dismissed = widgets::modal(ctx, "hosts-import", 470.0, |ui| {
+        let both = d.entries > 0 && !d.block.names.is_empty();
+        let dismissed = widgets::modal(ctx, "hosts-import", 500.0, |ui| {
             let p = pal(ui);
-            widgets::modal_title(ui, "Merge entries into the hosts file");
-            widgets::para(
+            widgets::modal_title(
                 ui,
-                &format!(
-                    "{} has {count} entries{}. Entries that are already in your hosts file are \
-                     skipped. A name that already points to a different address is added \
-                     switched off, so nothing that works now changes.",
-                    d.file,
-                    if problems > 0 {
-                        format!(" ({problems} with problems)")
-                    } else {
-                        String::new()
-                    }
-                ),
+                if d.as_block {
+                    "Add a block list to the hosts file"
+                } else {
+                    "Merge entries into the hosts file"
+                },
             );
+            if both {
+                ui.add_space(2.0);
+                if let Some(i) = widgets::segmented(
+                    ui,
+                    &["As a block list", "As ordinary entries"],
+                    usize::from(!d.as_block),
+                ) {
+                    d.set_block(i == 0);
+                }
+                ui.add_space(6.0);
+            }
+            widgets::para(ui, &d.summary());
+            if d.as_block {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Point the names at")
+                        .size(12.5)
+                        .color(p.muted),
+                );
+                if let Some(i) =
+                    widgets::segmented(ui, &["0.0.0.0 (fails at once)", "127.0.0.1"], d.sink)
+                {
+                    d.sink = i;
+                }
+                if d.block.names.len() + self.rows.len() > MANY_NAMES {
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "With this many names Windows itself becomes slow at looking \
+                                 names up, because it reads the whole hosts file. A shorter \
+                                 list works better.",
+                            )
+                            .size(12.5)
+                            .color(p.warn),
+                        )
+                        .wrap(),
+                    );
+                }
+            }
             ui.add_space(6.0);
             ui.label(
                 RichText::new("Put them in the group")
@@ -2119,7 +2778,8 @@ impl HostsView {
             ui.add(egui::TextEdit::singleline(&mut d.group).desired_width(f32::INFINITY));
             ui.add_space(10.0);
             widgets::button_row(ui, |ui| {
-                if widgets::primary_button(ui, "Merge", !d.group.trim().is_empty()).clicked() {
+                let label = if d.as_block { "Add the names" } else { "Merge" };
+                if widgets::primary_button(ui, label, !d.group.trim().is_empty()).clicked() {
                     merge = true;
                 }
                 if widgets::ghost_button(ui, "Cancel").clicked() {
@@ -2128,20 +2788,84 @@ impl HostsView {
             });
         });
         if merge {
-            let report = self.doc.merge(&d.doc, d.group.trim());
-            self.changed();
-            sh.toast(
+            let text = if d.as_block {
+                let report =
+                    self.doc
+                        .add_block_list(&d.block.names, SINKS[d.sink.min(1)], d.group.trim());
+                block_report_text(&report)
+            } else {
+                let report = self.doc.merge(&d.doc, d.group.trim());
                 format!(
                     "{} added, {} already there, {} added switched off because of a conflict. \
                      Save to apply.",
-                    report.added, report.already_present, report.conflicts
-                ),
-                false,
-            );
+                    thousands(report.added),
+                    thousands(report.already_present),
+                    thousands(report.conflicts)
+                )
+            };
+            self.changed();
+            sh.toast(text, false);
             return false;
         }
         keep && !dismissed
     }
+}
+
+/// The toast after a block list was added.
+fn block_report_text(report: &hosts::BlockReport) -> String {
+    let mut s = format!(
+        "{} name{} added",
+        thousands(report.added),
+        if report.added == 1 { "" } else { "s" }
+    );
+    if report.already_blocked > 0 {
+        s.push_str(&format!(
+            ", {} already blocked",
+            thousands(report.already_blocked)
+        ));
+    }
+    if report.kept_yours > 0 {
+        s.push_str(&format!(
+            ", {} left alone because your hosts file maps them",
+            thousands(report.kept_yours)
+        ));
+    }
+    s.push_str(if report.added > 0 {
+        ". Save to apply."
+    } else {
+        ". Nothing to save."
+    });
+    s
+}
+
+/// Invented cache content for `--demo`.
+fn demo_dns_cache() -> Vec<DnsCacheEntry> {
+    let e = |name: &str, record_type: u16| DnsCacheEntry {
+        name: name.into(),
+        record_type,
+    };
+    hosts_store::tidy_dns_cache(vec![
+        e("shop.test", 1),
+        e("shop.test", 28),
+        e("api.shop.test", 1),
+        e("admin.shop.test", 1),
+        e("staging.example.test", 1),
+        e("nas.lab", 1),
+        e("printer.lab", 1),
+        e("updates.example.net", 1),
+        e("updates.example.net", 28),
+        e("cdn.example.net", 5),
+        e("cdn.example.net", 65),
+        e("mail.example.org", 1),
+        e("_ldap._tcp.corp.example.org", 33),
+        e("registry.packages.example", 1),
+        e("registry.packages.example", 28),
+        e("telemetry.vendor.example", 1),
+        e("10.2.0.192.in-addr.arpa", 12),
+        e("time.example.net", 1),
+        e("fonts.example.com", 1),
+        e("fonts.example.com", 65),
+    ])
 }
 
 /// Column widths of the entries table.
@@ -2196,6 +2920,132 @@ mod tests {
         assert_eq!(edit_problems("", "").len(), 2);
         assert_eq!(edit_problems("300.1.1.1", "a.test").len(), 1);
         assert_eq!(edit_problems("10.0.0.1", "ok.test bad/name").len(), 1);
+    }
+
+    #[test]
+    fn caches_follow_the_document() {
+        let mut v = HostsView::new(true, Path::new("C:\\nowhere"));
+        assert_eq!(v.enabled_count, 10);
+        assert_eq!(
+            v.plain_groups,
+            vec![
+                "localhost name resolution is handled within DNS itself.",
+                "Local development",
+                "Staging servers",
+                "Lab network"
+            ]
+        );
+        assert_eq!(v.active_profiles, vec!["dev"]);
+        assert!(v.profile_active("dev") && !v.profile_active("staging"));
+        assert!(v.names_on.contains("shop.test") && !v.names_on.contains("legacy.shop.test"));
+        assert!(!v.has_duplicates);
+        v.doc
+            .add_entry(Entry::new("127.0.0.1", &["Shop.Test"]), None);
+        v.changed();
+        assert!(v.has_duplicates && v.has_unsaved());
+        assert_eq!(v.doc.remove_duplicates(), 1);
+        v.changed();
+        assert!(!v.has_duplicates);
+        v.doc.profile_off("dev");
+        v.changed();
+        assert!(v.active_profiles.is_empty());
+        assert!(!v.is_saving() && !v.has_dialog());
+    }
+
+    #[test]
+    fn long_files_use_the_fast_raw_view_and_small_ones_do_not() {
+        let mut v = HostsView::new(true, Path::new("C:\\nowhere"));
+        assert!(v.doc.lines.len() <= LARGE_LINES);
+        v.apply_view("hosts-raw-large");
+        assert!(v.doc.lines.len() > LARGE_LINES);
+        assert!(v.sub == Sub::Raw && !v.raw_edit_large);
+        assert!(!v.has_unsaved(), "the demo list counts as the file on disk");
+        // Choosing to edit as text sticks until the file is short again.
+        v.raw_edit_large = true;
+        v.changed();
+        assert!(v.raw_edit_large);
+        v.doc = HostsDoc::parse("127.0.0.1 a.test\r\n");
+        v.changed();
+        assert!(!v.raw_edit_large);
+    }
+
+    #[test]
+    fn import_dialog_recognises_block_lists() {
+        // A plain list of names is not a hosts file at all: block list only.
+        let d = ImportDlg::new(
+            "names.txt",
+            HostsDoc::parse("ads.example\ntracker.example\n"),
+        );
+        assert!(d.as_block);
+        assert_eq!((d.entries, d.block.names.len()), (0, 2));
+        assert_eq!(d.group, "Block list: names.txt");
+        assert!(d.summary().contains("2 names to block"));
+
+        // A few ordinary entries: merged line by line, as before.
+        let mut d = ImportDlg::new(
+            "team.hosts",
+            HostsDoc::parse("10.0.0.5 intranet.example\n10.0.0.6 wiki.example\n"),
+        );
+        assert!(!d.as_block);
+        assert_eq!(d.group, "Imported from team.hosts");
+        assert!(d.summary().contains("2 entries"));
+        // Switching the way of importing renames the untouched group...
+        d.set_block(true);
+        assert_eq!(d.group, "Block list: team.hosts");
+        // ...but not one the user typed.
+        d.group = "Mine".into();
+        d.set_block(false);
+        assert_eq!(d.group, "Mine");
+
+        // Many names that all point nowhere: a block list in hosts format.
+        let text: String = (0..50)
+            .map(|i| format!("0.0.0.0 ads{i}.example\n"))
+            .chain([
+                "0.0.0.0 ads1.example\n".to_string(),
+                "||*.x.example^\n".to_string(),
+            ])
+            .collect();
+        let d = ImportDlg::new("list.txt", HostsDoc::parse(&text));
+        assert!(d.as_block);
+        let s = d.summary();
+        assert!(s.contains("50 names") && s.contains("1 listed more than once"));
+        assert!(s.contains("1 line that cannot"));
+    }
+
+    #[test]
+    fn block_report_texts() {
+        let r = |added, already_blocked, kept_yours| hosts::BlockReport {
+            added,
+            already_blocked,
+            kept_yours,
+        };
+        assert_eq!(
+            block_report_text(&r(1, 0, 0)),
+            "1 name added. Save to apply."
+        );
+        assert_eq!(
+            block_report_text(&r(12_000, 30, 2)),
+            "12,000 names added, 30 already blocked, 2 left alone because your hosts file maps \
+             them. Save to apply."
+        );
+        assert!(block_report_text(&r(0, 5, 0)).ends_with("Nothing to save."));
+    }
+
+    #[test]
+    fn demo_dns_cache_is_sorted_and_invented() {
+        let mut v = HostsView::new(true, Path::new("C:\\nowhere"));
+        v.apply_view("hosts-dns");
+        v.load_dns();
+        let list = v.dns.clone().unwrap();
+        assert!(list.len() >= 15);
+        assert!(list
+            .windows(2)
+            .all(|w| w[0].name.to_lowercase() <= w[1].name.to_lowercase()));
+        assert!(list.iter().all(|e| e.name.ends_with(".test")
+            || e.name.ends_with(".lab")
+            || e.name.contains("example")
+            || e.name.ends_with(".arpa")));
+        assert!(list.iter().any(|e| v.names_on.contains(&e.name)));
     }
 
     #[test]

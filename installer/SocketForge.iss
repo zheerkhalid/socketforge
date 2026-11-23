@@ -1,7 +1,11 @@
 ; SocketForge installer (Inno Setup 6). Installs for the current user; no administrator rights needed.
 
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "1.1.0"
+#endif
+; Where cargo put the build (scripts\package.ps1 passes CARGO_TARGET_DIR when it is set).
+#ifndef TargetDir
+  #define TargetDir "..\target"
 #endif
 
 [Setup]
@@ -21,7 +25,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist
 OutputBaseFilename=SocketForge-Setup
-SetupIconFile=..\target\socketforge.ico
+SetupIconFile={#TargetDir}\socketforge.ico
 UninstallDisplayIcon={app}\SocketForge.exe
 Compression=lzma2/ultra64
 SolidCompression=yes
@@ -37,7 +41,7 @@ VersionInfoDescription=SocketForge Setup
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "..\target\release\SocketForge.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#TargetDir}\release\SocketForge.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 
 [Icons]

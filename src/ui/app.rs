@@ -10,6 +10,7 @@ use super::lookup_view::LookupState;
 use super::rules_view::RulesState;
 use super::shared::Shared;
 use super::theme::{self, pal_ctx, regular, semibold, Icon};
+use super::tools_view::ToolsState;
 use super::widgets;
 use super::worker::{Notices, Resolver, Worker, WorkerConfig};
 use crate::actions;
@@ -21,8 +22,8 @@ use crate::settings::{self, Settings};
 use crate::tray::{self, Tray, TrayEvent};
 use crate::view::{self, ConnectionRow, ListenerRow};
 use eframe::egui::{
-    self, vec2, Align, Align2, Color32, CornerRadius, Frame, Key, Layout, Margin, Rect, RichText,
-    Sense, Stroke, TextureHandle,
+    self, pos2, vec2, Align, Align2, Color32, CornerRadius, Frame, Key, Layout, Margin, Rect,
+    RichText, Sense, Stroke, TextureHandle,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -60,6 +61,7 @@ pub enum Tab {
     History,
     Hosts,
     Rules,
+    Tools,
     Settings,
 }
 
@@ -74,6 +76,7 @@ impl Tab {
             "history" | "watch" => Tab::History,
             "hosts" => Tab::Hosts,
             "rules" | "firewall" | "system" => Tab::Rules,
+            "tools" | "serve" | "forward" => Tab::Tools,
             "settings" => Tab::Settings,
             _ => return None,
         })
@@ -126,7 +129,18 @@ pub struct App {
     pub(super) lookup: LookupState,
     pub(super) hist: HistState,
     pub(super) rules: RulesState,
+    pub(super) tools: ToolsState,
     pub(super) dialog: Dialog,
+    /// The note box of the details panel: which port it is for, and its text.
+    pub(super) note_edit: (Option<(bool, u16)>, String),
+
+    // ---- Closing with unsaved hosts edits ----
+    /// The "save before closing?" dialog is open.
+    close_dialog: bool,
+    /// "Save and close" was chosen: close once the save went through.
+    close_after_save: bool,
+    /// The user decided: do not ask again.
+    close_confirmed: bool,
 
     // ---- Notification area ----
     tray: Option<Tray>,
@@ -241,7 +255,12 @@ impl App {
             lookup: LookupState::default(),
             hist: HistState::default(),
             rules: RulesState::default(),
+            tools: ToolsState::default(),
             dialog: Dialog::None,
+            note_edit: (None, String::new()),
+            close_dialog: false,
+            close_after_save: false,
+            close_confirmed: false,
             tray: None,
             tray_tx,
             tray_rx,
@@ -262,6 +281,16 @@ impl App {
     /// Fills every view with the invented PC of `demo.rs`.
     fn load_demo(&mut self) {
         self.sh.settings.watched_ports = demo::watched_ports();
+        // A few notes and favourites, as someone who uses them would have.
+        for (port, note) in [
+            (22, "SSH for the deploy script"),
+            (3000, "Storefront API: npm run dev"),
+            (5432, "Local database for the shop"),
+            (8080, "Admin panel behind the proxy"),
+        ] {
+            self.sh.settings.set_note(true, port, note);
+            self.sh.settings.toggle_favourite(true, port);
+        }
         self.sys = demo::system();
         self.sys_loaded = true;
         // Two refreshes, so that one row is new and one has just closed.
@@ -288,6 +317,7 @@ impl App {
             Tab::Connections => self.conn_apply_view(view),
             Tab::Lookup => self.lookup_apply_view(view),
             Tab::Rules => self.rules_apply_view(view),
+            Tab::Tools => self.tools_apply_view(view),
             Tab::History | Tab::Settings => {}
         }
     }
@@ -549,6 +579,99 @@ impl App {
         }
     }
 
+    /// Closing the window must not silently drop hosts edits: ask first.
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        if self.sh.demo || self.shot.is_some() || self.close_confirmed {
+            return;
+        }
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        if !self.hosts.has_unsaved() && !self.hosts.is_saving() {
+            return;
+        }
+        // Closing to the notification area keeps the editor and its changes.
+        let to_tray = !self.exiting
+            && self.sh.settings.close_to_tray
+            && self.sh.settings.tray_icon
+            && self.tray.is_some();
+        if to_tray {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if self.exiting {
+            // "Exit" came from the notification area: the window may be hidden.
+            self.exiting = false;
+            tray::show_window(self.hwnd);
+        }
+        self.tab = Tab::Hosts;
+        self.hosts.show_entries();
+        if self.hosts.is_saving() {
+            self.sh.toast(
+                "The hosts file is still being saved. Close again when it is done.",
+                false,
+            );
+        } else {
+            self.close_dialog = true;
+        }
+    }
+
+    fn close_dialog_ui(&mut self, ctx: &egui::Context) {
+        if self.close_after_save && !self.hosts.is_saving() {
+            self.close_after_save = false;
+            // Still unsaved: the save failed, was cancelled at the administrator
+            // prompt, or needs an answer first. Stay open.
+            if !self.hosts.has_unsaved() {
+                self.close_now(ctx);
+            }
+        }
+        if !self.close_dialog {
+            return;
+        }
+        if !self.hosts.has_unsaved() {
+            self.close_dialog = false;
+            return;
+        }
+        let (mut save, mut discard, mut cancel) = (false, false, false);
+        let dismissed = widgets::modal(ctx, "close-unsaved", 470.0, |ui| {
+            widgets::modal_title(ui, "Save the hosts file before closing?");
+            widgets::para(
+                ui,
+                "The hosts editor has changes that are not saved yet. Closing without saving \
+                 drops them; the hosts file itself stays as it is.",
+            );
+            ui.add_space(10.0);
+            widgets::button_row(ui, |ui| {
+                if widgets::primary_button(ui, "Save and close", true).clicked() {
+                    save = true;
+                }
+                if widgets::danger_button(ui, "Close without saving", true).clicked() {
+                    discard = true;
+                }
+                if widgets::ghost_button(ui, "Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if save {
+            self.close_dialog = false;
+            self.close_after_save = true;
+            self.hosts.save_now(ctx, &mut self.sh);
+        } else if discard {
+            self.close_dialog = false;
+            self.close_now(ctx);
+        } else if cancel || dismissed {
+            self.close_dialog = false;
+        }
+    }
+
+    /// Really closes the window: no more questions, not into the notification area.
+    fn close_now(&mut self, ctx: &egui::Context) {
+        self.close_confirmed = true;
+        self.exiting = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
     /// Passes changed settings on to the refresh threads and the tray icon.
     fn sync_settings(&mut self) {
         if let Some(worker) = &self.worker {
@@ -576,7 +699,12 @@ impl App {
             self.refresh(true);
         }
         // Dialogs close themselves on Esc; after that the search, then the side panel.
-        if escape && !self.about_open && !self.dialog.is_open() {
+        if escape
+            && !self.about_open
+            && !self.close_dialog
+            && !self.dialog.is_open()
+            && !self.hosts.has_dialog()
+        {
             if !self.sh.search.is_empty() {
                 self.sh.search.clear();
             } else if self.tab == Tab::Listening {
@@ -668,7 +796,7 @@ impl App {
 
                     // Search
                     let search_width = (ui.available_width() - 380.0).clamp(220.0, 460.0);
-                    let enabled = self.tab != Tab::Settings;
+                    let enabled = self.tab != Tab::Settings && self.tab != Tab::Tools;
                     Frame::new()
                         .fill(if p.dark { p.card } else { p.bg })
                         .stroke(Stroke::new(1.0_f32, p.border))
@@ -693,7 +821,7 @@ impl App {
                                     Tab::History => "Search the history",
                                     Tab::Hosts => "Search host names and addresses",
                                     Tab::Rules => "Search rules: port, program, name",
-                                    Tab::Settings => "Search",
+                                    Tab::Tools | Tab::Settings => "Search",
                                 };
                                 let edit = egui::TextEdit::singleline(&mut self.sh.search)
                                     .hint_text(RichText::new(hint).color(p.faint))
@@ -736,6 +864,15 @@ impl App {
                             if widgets::ghost_button(ui, "Restart as administrator").clicked() {
                                 if self.sh.demo {
                                     self.sh.toast("Not available in the demo.", false);
+                                } else if self.hosts.has_unsaved() || self.hosts.is_saving() {
+                                    // The restarted copy would open without the edits.
+                                    self.tab = Tab::Hosts;
+                                    self.hosts.show_entries();
+                                    self.sh.toast(
+                                        "Save or revert the hosts changes first; a restart \
+                                         would drop them.",
+                                        true,
+                                    );
                                 } else {
                                     match actions::restart_as_admin() {
                                         Ok(()) => {
@@ -774,7 +911,7 @@ impl App {
                     Stroke::new(1.0_f32, p.border),
                 );
                 ui.spacing_mut().item_spacing.y = 4.0;
-                let items: [(Tab, Icon, &str, Option<usize>); 7] = [
+                let items: [(Tab, Icon, &str, Option<usize>); 8] = [
                     (
                         Tab::Listening,
                         Icon::PLUG,
@@ -801,6 +938,7 @@ impl App {
                         "Rules & forwards",
                         self.rules_count(),
                     ),
+                    (Tab::Tools, Icon::TOOLS, "Tools", self.tools_count()),
                     (Tab::Settings, Icon::SETTINGS, "Settings", None),
                 ];
                 for (tab, icon, label, count) in items {
@@ -844,14 +982,26 @@ impl App {
                         },
                         fg,
                     );
+                    // A running tool shows as a green count; unsaved hosts edits as a dot.
+                    let running = tab == Tab::Tools && count.is_some();
+                    let mut count_right = rect.right() - 12.0;
                     if let Some(n) = count {
-                        ui.painter().text(
-                            rect.right_center() - vec2(12.0, 1.0),
+                        let r = ui.painter().text(
+                            pos2(count_right, rect.center().y - 1.0),
                             Align2::RIGHT_CENTER,
-                            n.to_string(),
+                            super::settings_view::thousands(n),
                             regular(12.5),
-                            p.faint,
+                            if running { p.accent } else { p.faint },
                         );
+                        count_right = r.left() - 8.0;
+                    }
+                    if tab == Tab::Hosts && self.hosts.has_unsaved() {
+                        ui.painter().circle_filled(
+                            pos2(count_right, rect.center().y),
+                            3.5,
+                            p.accent,
+                        );
+                        resp.clone().on_hover_text("Unsaved changes");
                     }
                     if resp.clicked() && self.tab != tab {
                         self.tab = tab;
@@ -986,6 +1136,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump(ctx);
         self.handle_tray(ctx);
+        self.handle_close(ctx);
         self.handle_keys(ctx);
         self.handle_screenshot(ctx);
 
@@ -1013,10 +1164,12 @@ impl eframe::App for App {
                 Tab::History => self.history_ui(ui),
                 Tab::Hosts => self.hosts.ui(ui, &mut self.sh),
                 Tab::Rules => self.rules_ui(ui),
+                Tab::Tools => self.tools_ui(ui),
                 Tab::Settings => self.settings_ui(ui),
             });
 
         self.hosts.dialogs(ctx, &mut self.sh);
+        self.close_dialog_ui(ctx);
         self.dialogs_ui(ctx);
         self.about_dialog(ctx);
         self.toasts_ui(ctx);

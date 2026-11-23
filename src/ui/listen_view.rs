@@ -36,6 +36,8 @@ pub struct ListenState {
     pub collapsed: HashSet<String>,
     /// Bring the selected row into view on the next frame.
     pub scroll_to_selected: bool,
+    /// Show only the ports marked as favourites.
+    pub favourites_only: bool,
 }
 
 impl Default for ListenState {
@@ -46,6 +48,7 @@ impl Default for ListenState {
             selected: None,
             collapsed: HashSet::new(),
             scroll_to_selected: false,
+            favourites_only: false,
         }
     }
 }
@@ -105,6 +108,16 @@ impl Columns {
             + self.exposure
             + self.since
     }
+}
+
+/// True when every word of the search is in the note.
+pub(super) fn note_matches(note: &str, search: &str) -> bool {
+    let needle = search.trim().to_lowercase();
+    if needle.is_empty() || note.is_empty() {
+        return false;
+    }
+    let note = note.to_lowercase();
+    needle.split_whitespace().all(|w| note.contains(w))
 }
 
 /// Lower = more exposed, so that an ascending sort puts open ports first.
@@ -285,15 +298,29 @@ impl App {
             .map(|(_, row, state)| (row.clone(), tint_of(state)))
             .collect();
         let search = self.sh.search.clone();
-        let searched: Vec<&(ListenerRow, RowTint)> = all
-            .iter()
-            .filter(|(r, _)| view::search_matches(r, &search))
-            .collect();
-        let mut filter = self.listen.filter.clone();
-        filter.search = search.clone();
+        // The search also looks into your own notes.
+        let settings = &self.sh.settings;
+        let found = |r: &ListenerRow| {
+            view::search_matches(r, &search)
+                || note_matches(
+                    settings.note(r.listener.proto == Proto::Tcp, r.listener.port),
+                    &search,
+                )
+        };
+        let is_favourite = |r: &ListenerRow| {
+            settings.is_favourite(r.listener.proto == Proto::Tcp, r.listener.port)
+        };
+        let searched: Vec<&(ListenerRow, RowTint)> = all.iter().filter(|(r, _)| found(r)).collect();
+        let favourite_count = searched.iter().filter(|(r, _)| is_favourite(r)).count();
+        let filter = self.listen.filter.clone();
+        let favourites_only = self.listen.favourites_only;
         let mut visible: Vec<(ListenerRow, RowTint)> = all
             .iter()
-            .filter(|(r, _)| view::filter_matches(r, &filter))
+            .filter(|(r, _)| {
+                view::filter_matches(r, &filter)
+                    && found(r)
+                    && (!favourites_only || is_favourite(r))
+            })
             .cloned()
             .collect();
         sort_rows(&mut visible, self.listen.sort);
@@ -416,6 +443,25 @@ impl App {
                 {
                     *on = !*on;
                 }
+            }
+            if !narrow {
+                ui.add_space(6.0);
+            }
+            let star = if narrow {
+                Icon::STAR_FILLED.glyph().to_string()
+            } else {
+                Icon::STAR_FILLED.with("Favourites")
+            };
+            if widgets::chip(
+                ui,
+                &star,
+                (!narrow).then_some(favourite_count),
+                self.listen.favourites_only,
+            )
+            .on_hover_text("Only the ports you marked with a star (in the details panel)")
+            .clicked()
+            {
+                self.listen.favourites_only = !self.listen.favourites_only;
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let current = match self.sh.settings.group_by {
@@ -714,6 +760,9 @@ impl App {
         let l = &row.listener;
         let mut x = rect.left() + LEFT_PAD;
 
+        let tcp = l.proto == Proto::Tcp;
+        let favourite = self.sh.settings.is_favourite(tcp, l.port);
+        let note = self.sh.settings.note(tcp, l.port);
         widgets::text_in(
             ui,
             widgets::cell(rect, x, cols.port),
@@ -721,6 +770,15 @@ impl App {
             semibold(15.0),
             text,
         );
+        if favourite {
+            ui.painter().text(
+                pos2(rect.left() + 7.0, rect.center().y),
+                egui::Align2::CENTER_CENTER,
+                Icon::STAR_FILLED.glyph(),
+                regular(9.0),
+                if closed { p.faint } else { p.warn },
+            );
+        }
         x += cols.port;
 
         let proto_color = match l.proto {
@@ -778,12 +836,18 @@ impl App {
         x += cols.process;
 
         if cols.service > 0.0 {
+            // Your own note says more than the usual use of the port number.
+            let (label, color) = if note.is_empty() {
+                (row.well_known.unwrap_or(""), muted)
+            } else {
+                (note, if closed { p.faint } else { p.accent })
+            };
             widgets::text_in(
                 ui,
                 widgets::cell(rect, x, cols.service),
-                row.well_known.unwrap_or(""),
+                label,
                 regular(13.0),
-                muted,
+                color,
             );
             x += cols.service;
         }
@@ -920,6 +984,15 @@ mod tests {
             connect_line(find(139, demo::LAN)),
             format!("{}:139", demo::LAN)
         );
+    }
+
+    #[test]
+    fn notes_are_searched_word_by_word() {
+        assert!(note_matches("Storefront dev server", "dev store"));
+        assert!(note_matches("Storefront dev server", " SERVER "));
+        assert!(!note_matches("Storefront dev server", "dev database"));
+        assert!(!note_matches("", "dev"));
+        assert!(!note_matches("anything", ""));
     }
 
     #[test]
